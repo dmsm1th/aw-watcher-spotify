@@ -1,67 +1,94 @@
 aw-watcher-spotify
 ==================
 
-Watches your currently playing Spotify track. This is on a per-user basis since it uses the Spotify Web API, so you don't need to run it on all your machines if you don't want the redundancy.
+Watches your currently playing Spotify track and logs it to [ActivityWatch](https://activitywatch.net/).
 
-This watcher is currently in a early stage of development, please submit PRs if you find bugs!
+Forked from [ActivityWatch/aw-watcher-spotify](https://github.com/ActivityWatch/aw-watcher-spotify). The original uses the Spotify Web API and requires OAuth credentials. This fork replaces that with AppleScript, querying the local Spotify desktop app directly — no API keys or login flow needed.
+
+**macOS only.**
 
 
-## Usage
+## Requirements
 
-### Step 0: Create Spotify Web API token
+- macOS
+- [ActivityWatch](https://activitywatch.net/) running locally
+- Spotify desktop app (not just the web player)
+- Python 3.7+
 
-Go to [Spotify Developer Dashboard](https://developer.spotify.com/dashboard/applications) and create a new application.
 
-In the app settings, add `http://127.0.0.1:8088` in the Redirect URIs section.
-
-### Step 1: Install package (using poetry)
-
-Requirements: Requires that you have poetry installed.
-
-First install the package and its dependencies:
+## Installation
 
 ```sh
-poetry install
-```
-
-First run (generates empty config that you need to fill out):
-
-```sh
-poetry run aw-watcher-spotify
-```
-### Step 1: Install package (without poetry, using only pip)
-
-Install the requirements:
-
-```sh
+cd aw-watcher-spotify
 pip install .
 ```
 
-First run (generates empty config that you need to fill out):
+
+## Running manually
+
 ```sh
-python aw-watcher-spotify/main.py
+aw-watcher-spotify
 ```
 
-### Step 2: Enter credentials
+Make sure ActivityWatch and the Spotify desktop app are both open first.
 
-If this is the first time you run it on your machine, it will give you an error, this is normal.
-Just fill in the config file (the directory is referenced in the error).
 
-Run the script again and...
-You're done! Try playing a song on Spotify on any of your devices and it should start logging (provided they are not in offline mode).
+## Auto-start on login (recommended)
+
+Create a launchd plist at `~/Library/LaunchAgents/net.activitywatch.aw-watcher-spotify.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>net.activitywatch.aw-watcher-spotify</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/aw-watcher-spotify</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/yourusername/Library/Logs/aw-watcher-spotify.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/yourusername/Library/Logs/aw-watcher-spotify.log</string>
+</dict>
+</plist>
+```
+
+Replace `/path/to/aw-watcher-spotify` with the output of `which aw-watcher-spotify` (or `pyenv which aw-watcher-spotify` if using pyenv).
+
+Then load it:
+
+```sh
+launchctl load ~/Library/LaunchAgents/net.activitywatch.aw-watcher-spotify.plist
+```
+
+
+## Configuration
+
+Config is stored in the ActivityWatch config directory (printed on first run).
+
+```toml
+[aw-watcher-spotify]
+poll_time = 5.0
+```
+
+The watcher polls Spotify every `poll_time` seconds. Events within `poll_time + 1` seconds are merged into a continuous session in ActivityWatch.
+
+
+## Limitations
+
+- macOS only (requires AppleScript and the Spotify desktop app)
+- Only tracks playback on the local machine — other devices on your Spotify account are not tracked
+- Podcast/episode metadata is limited to what AppleScript exposes
+- `popularity` field is not available (was Spotify Web API only)
 
 
 ## Note
 
-Even without using this watcher, you can get a full export of the last year of listening history by requesting an export directly from Spotify here: https://www.spotify.com/us/account/privacy/
-
-The export contains, among other things:
-
-- **Streaming history for the past year**
-- Playlists
-- Search queries
-- A list of items saved in your library
-- User data
-- Inferences
-
-(thanks [@oreHGA](https://github.com/oreHGA) for the tip!)
+You can get a full export of your last year of listening history directly from Spotify at https://www.spotify.com/us/account/privacy/ — useful as a one-time historical import alongside real-time tracking.
