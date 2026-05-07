@@ -2,17 +2,12 @@
 
 import sys
 import logging
+import subprocess
 import traceback
 from typing import Optional
 from time import sleep
 from datetime import datetime, timezone, timedelta
-import json
 import argparse
-
-from requests import ConnectionError
-from spotipy.exceptions import SpotifyException
-from spotipy import Spotify
-from spotipy.oauth2 import SpotifyOAuth, SpotifyOauthError
 
 from aw_core import dirs
 from aw_core.models import Event
@@ -22,54 +17,56 @@ from aw_core.log import setup_logging
 
 DEFAULT_CONFIG = """
 [aw-watcher-spotify]
-username = ""
-client_id = ""
-client_secret = ""
 poll_time = 5.0"""
 
-
-def get_current_track(sp) -> Optional[dict]:
-    current_track = sp.currently_playing(additional_types=["episode"])
-    if current_track and current_track["is_playing"]:
-        return current_track
-    return None
-
-
-def data_from_track(track: dict, sp) -> dict:
-    song_name = track["item"]["name"]
-    data = {}
-    data["title"] = song_name
-    data["uri"] = track["item"]["uri"]
-
-    if track["item"]["type"] == "track":
-        artist_name = track["item"]["artists"][0]["name"]
-        album_name = track["item"]["album"]["name"]
-        data["popularity"] = track["item"]["popularity"] or -1
-        data["album"] = album_name
-        data["artist"] = artist_name
-        logging.debug("TRACK: {} - {} ({})".format(song_name, artist_name, album_name))
-    elif track["item"]["type"] == "episode":
-        publisher = track["item"]["show"]["publisher"]
-        data["artist"] = publisher
-        data["album"] = track["item"]["show"]["name"]
-        logging.debug("EPISODE: {} - {}".format(song_name, publisher))
-
-    return data
+# AppleScript queries the local Spotify desktop app — no API credentials needed.
+# Returns pipe-delimited fields or a sentinel string.
+_APPLESCRIPT = """
+tell application "Spotify"
+    if it is running then
+        if player state is playing then
+            set t to current track
+            return (get name of t) & "|||" & (get artist of t) & "|||" & (get album of t) & "|||" & (get spotify url of t)
+        else
+            return "PAUSED"
+        end if
+    else
+        return "NOT_RUNNING"
+    end if
+end tell
+"""
 
 
-def auth(username: str, client_id: str, client_secret: str) -> Spotify:
-    scope = "user-read-currently-playing"
+def get_current_track() -> Optional[dict]:
     try:
-        auth_manager = SpotifyOAuth(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri="http://127.0.0.1:8088",
-            scope=scope,
-            cache_path=f".cache-{username}",
+        result = subprocess.run(
+            ["osascript", "-e", _APPLESCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
-        return Spotify(auth_manager=auth_manager)
-    except SpotifyOauthError as e:
-        sys.exit(1)
+        output = result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        logging.warning("AppleScript timed out querying Spotify")
+        return None
+    except OSError as exc:
+        logging.error("Failed to run osascript: %s", exc)
+        return None
+
+    if output in ("NOT_RUNNING", "PAUSED", ""):
+        return None
+
+    parts = output.split("|||")
+    if len(parts) != 4:
+        logging.warning("Unexpected AppleScript output: %r", output)
+        return None
+
+    return {
+        "title": parts[0],
+        "artist": parts[1],
+        "album": parts[2],
+        "uri": parts[3],
+    }
 
 
 def load_config():
@@ -79,10 +76,8 @@ def load_config():
 
 
 def print_statusline(msg):
-    last_msg_length = (
-        len(print_statusline.last_msg) if hasattr(print_statusline, "last_msg") else 0
-    )
-    print(" " * last_msg_length, end="\r")
+    last_len = len(print_statusline.last_msg) if hasattr(print_statusline, "last_msg") else 0
+    print(" " * last_len, end="\r")
     print(msg, end="\r")
     print_statusline.last_msg = msg
 
@@ -99,91 +94,49 @@ def main():
         log_stderr=True,
         log_file=True,
     )
-    config_dir = dirs.get_config_dir("aw-watcher-spotify")
+
+    if sys.platform != "darwin":
+        logging.error("This watcher uses AppleScript and only runs on macOS.")
+        sys.exit(1)
 
     config = load_config()
     poll_time = float(config["aw-watcher-spotify"].get("poll_time"))
-    username = config["aw-watcher-spotify"].get("username", None)
-    client_id = config["aw-watcher-spotify"].get("client_id", None)
-    client_secret = config["aw-watcher-spotify"].get("client_secret", None)
-    if not username or not client_id or not client_secret:
-        logging.warning(
-            "username, client_id or client_secret not specified in config file (in folder {}). Get your client_id and client_secret here: https://developer.spotify.com/my-applications/".format(
-                config_dir
-            )
-        )
-        sys.exit(1)
 
-    # TODO: Fix --testing flag and set testing as appropriate
-    aw = ActivityWatchClient("aw-watcher-spotify", testing=False)
+    aw = ActivityWatchClient("aw-watcher-spotify", testing=args.testing)
     bucketname = "{}_{}".format(aw.client_name, aw.client_hostname)
     aw.create_bucket(bucketname, "currently-playing", queued=True)
     aw.connect()
 
-    sp = auth(username, client_id=client_id, client_secret=client_secret)
-    last_track = None
-    track = None
+    last_track: Optional[dict] = None
     while True:
         try:
-            track = get_current_track(sp)
-            # from pprint import pprint
-            # pprint(track)
-        except SpotifyException as e:
-            print_statusline("\nToken expired, trying to refresh\n")
-            sp = auth(username, client_id=client_id, client_secret=client_secret)
-            continue
-        except ConnectionError as e:
-            logging.error(
-                "Connection error while trying to get track, check your internet connection."
-            )
+            track = get_current_track()
+        except Exception:
+            logging.error("Unexpected error fetching track:\n%s", traceback.format_exc())
             sleep(poll_time)
-            continue
-        except json.JSONDecodeError as e:
-            logging.error("Error trying to decode")
-            sleep(0.1)
-            continue
-        except Exception as e:
-            logging.error("Unknown Error")
-            logging.error(traceback.format_exc())
-            sleep(0.1)
             continue
 
         try:
-            # Outputs a new line when a song ends, giving a short history directly in the log
-            if last_track:
-                last_track_data = data_from_track(last_track, sp)
-                if not track or (
-                    track
-                    and last_track_data["uri"] != data_from_track(track, sp)["uri"]
-                ):
-                    song_td = timedelta(seconds=last_track["progress_ms"] / 1000)
-                    song_time = int(song_td.seconds / 60), int(song_td.seconds % 60)
-                    print_statusline(
-                        "Track ended ({}:{:02d}): {title} - {artist} ({album})\n".format(
-                            *song_time, **last_track_data
-                        )
-                    )
-
-            if track:
-                track_data = data_from_track(track, sp)
-                song_td = timedelta(seconds=track["progress_ms"] / 1000)
-                song_time = int(song_td.seconds / 60), int(song_td.seconds % 60)
-
+            if last_track and (
+                not track or track["uri"] != last_track["uri"]
+            ):
                 print_statusline(
-                    "Current track ({}:{:02d}): {title} - {artist} ({album})".format(
-                        *song_time, **track_data
-                    )
+                    "Track ended: {title} - {artist} ({album})\n".format(**last_track)
                 )
 
-                event = Event(timestamp=datetime.now(timezone.utc), data=track_data)
+            if track:
+                print_statusline(
+                    "Now playing: {title} - {artist} ({album})".format(**track)
+                )
+                event = Event(timestamp=datetime.now(timezone.utc), data=track)
                 aw.heartbeat(bucketname, event, pulsetime=poll_time + 1, queued=True)
             else:
                 print_statusline("Waiting for track to start playing...")
 
             last_track = track
-        except Exception as e:
-            print("An exception occurred: {}".format(e))
-            traceback.print_exc()
+        except Exception:
+            logging.error("Unexpected error sending event:\n%s", traceback.format_exc())
+
         sleep(poll_time)
 
 
